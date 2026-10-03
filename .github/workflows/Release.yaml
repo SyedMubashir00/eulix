@@ -8,89 +8,82 @@ on:
 
 env:
   GO_VERSION: '1.27'
-  RUST_VERSION: 'stable'
 
 jobs:
-  build-linux:
-    name: Build Linux binaries
+  package-embed:
+    name: Package eulix-embed
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          rustflags: ''
-
-      - name: Build eulix-parser
-        working-directory: ./eulix-parser
-        run: |
-          cargo build --release
-
-      - name: Copy parser binary
-        run: |
-          mkdir -p eulix-cli/internal/assets/bins
-          cp eulix-parser/target/release/eulix_parser \
-            eulix-cli/internal/assets/bins/eulix_parser_linux
-
-      - name: Hash parser
-        id: parser_hash
-        run: |
-          HASH=$(sha256sum eulix-cli/internal/assets/bins/eulix_parser_linux | awk '{print $1}')
-          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Create eulix-embed.zip
         run: |
           zip -r eulix-embed.zip eulix-embed/ \
             -x "*/.venv/*" \
-            "*/.mypy_cache/*" \
-            "*/.git/*" \
-            "*/__pycache__/*" \
-            "*.pyc" \
-            ".codespell-ignore"
+               "*/.ruff_cache/*" \
+               "*/.pytest_cache/*" \
+               "*/.mypy_cache/*" \
+               "*/.git/*" \
+               "*/__pycache__/*" \
+               "*.pyc" \
+               ".codespell-ignore"
 
-      - name: Build Linux Go binaries
-        working-directory: ./eulix-cli
-        env:
-          HASH_LINUX: ${{ steps.parser_hash.outputs.hash }}
-        run: |
-          for pair in "onnx-amd.txt:amd" "onnx-nvidia.txt:nvidia"; do
-            req_file="${pair%%:*}"
-            tag="${pair##*:}"
-
-            echo "Building Linux '${tag}' variant..."
-
-            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build \
-              -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=${req_file}' -X 'eulix/internal/assets.embeddedParserHash=${HASH_LINUX}'" \
-              -trimpath \
-              -o "eulix_linux_${tag}" \
-              ./cmd/eulix/main.go
-          done
-
-      - name: Upload Linux artifacts
+      - name: Upload eulix-embed.zip
         uses: actions/upload-artifact@v4
         with:
-          name: build-linux
+          name: dist-embed
+          path: eulix-embed.zip
           if-no-files-found: error
-          path: |
-            eulix-cli/eulix_linux_amd
-            eulix-cli/eulix_linux_nvidia
-            eulix-parser/target/release/eulix_parser
-            eulix-embed.zip
 
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: package-embed
+    runs-on: ${{ matrix.os }}
 
-  build-windows:
-    name: Build Windows binaries
-    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash # Git Bash on Windows too, so the same scripts work everywhere
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ''
+            parser_bin: eulix_parser_linux
+            # "<requirements file>|<output name>"
+            variants: >-
+              onnx-amd.txt|eulix-linux-amd64-onnx-amd
+              onnx-nvidia.txt|eulix-linux-amd64-onnx-nvidia
+
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+            parser_bin: eulix_parser_windows.exe
+            variants: >-
+              onnx-amd.txt|eulix-windows-amd64-onnx-amd
+              onnx-nvidia.txt|eulix-windows-amd64-onnx-nvidia
+
+          - os: macos-15 # Apple Silicon
+            goos: darwin
+            goarch: arm64
+            ext: ''
+            parser_bin: eulix_parser_darwin
+            variants: >-
+              torch-nvidia.txt|eulix-darwin-arm64
+
+          - os: macos-15-intel # Intel
+            goos: darwin
+            goarch: amd64
+            ext: ''
+            parser_bin: eulix_parser_darwin
+            variants: >-
+              torch-nvidia.txt|eulix-darwin-amd64
 
     steps:
       - name: Checkout code
@@ -104,316 +97,113 @@ jobs:
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          rustflags: ''
+          toolchain: stable
+          cache-workspaces: eulix-parser
 
       - name: Build eulix-parser
         working-directory: ./eulix-parser
-        run: |
-          cargo build --release
+        run: cargo build --release
 
-      - name: Copy parser binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force eulix-cli/internal/assets/bins
-          Copy-Item `
-            eulix-parser/target/release/eulix_parser.exe `
-            eulix-cli/internal/assets/bins/eulix_parser_windows.exe
+      - name: Download eulix-embed.zip
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-embed
+          path: embed
 
-      - name: Hash parser
-        id: parser_hash
-        shell: pwsh
-        run: |
-          $hash = (Get-FileHash `
-            eulix-cli/internal/assets/bins/eulix_parser_windows.exe `
-            -Algorithm SHA256).Hash.ToLower()
-
-          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Create eulix-embed.zip
-        shell: bash
-        run: |
-          7z a eulix-embed.zip ./eulix-embed \
-            -xr!.venv \
-            -xr!.mypy_cache \
-            -xr!.git \
-            -xr!__pycache__ \
-            -xr!*.pyc
-
-      - name: Build Windows Go binaries
-        working-directory: ./eulix-cli
-        shell: pwsh
+      - name: Stage assets and hash parser
+        id: stage
         env:
-          HASH_WINDOWS: ${{ steps.parser_hash.outputs.hash }}
+          EXT: ${{ matrix.ext }}
+          PARSER_BIN: ${{ matrix.parser_bin }}
+          TARGET_OS: ${{ matrix.goos }}
+          TARGET_ARCH: ${{ matrix.goarch }}
         run: |
-          $variants = @(
-            @{ req = "onnx-amd.txt"; tag = "amd" },
-            @{ req = "onnx-nvidia.txt"; tag = "nvidia" }
-          )
+          BINS=eulix-cli/internal/assets/bins
+          mkdir -p "$BINS" dist
 
-          foreach ($variant in $variants) {
-            Write-Host "Building Windows '$($variant.tag)' variant..."
+          # parser -> embedded into the cli
+          cp "eulix-parser/target/release/eulix_parser${EXT}" "$BINS/${PARSER_BIN}"
 
-            $env:GOOS = "windows"
-            $env:GOARCH = "amd64"
-            $env:CGO_ENABLED = "0"
+          # parser -> standalone release asset
+          cp "eulix-parser/target/release/eulix_parser${EXT}" \
+             "dist/eulix-parser-${TARGET_OS}-${TARGET_ARCH}${EXT}"
 
-            go build `
-              -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=$($variant.req)' -X 'eulix/internal/assets.embeddedParserHash=$env:HASH_WINDOWS'" `
-              -trimpath `
-              -o "eulix_windows_$($variant.tag).exe" `
-              ./cmd/eulix/main.go
-          }
+          # embed zip -> embedded into the cli
+          cp embed/eulix-embed.zip "$BINS/eulix-embed.zip"
 
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-windows
-          if-no-files-found: error
-          path: |
-            eulix-cli/eulix_windows_amd.exe
-            eulix-cli/eulix_windows_nvidia.exe
-            eulix-parser/target/release/eulix_parser.exe
-
-
-  build-macos:
-    name: Build macOS binaries
-    runs-on: macos-14
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          rustflags: ''
-
-      - name: Build eulix-parser
-        working-directory: ./eulix-parser
-        run: |
-          cargo build --release
-
-      - name: Copy parser binary
-        run: |
-          mkdir -p eulix-cli/internal/assets/bins
-          cp eulix-parser/target/release/eulix_parser \
-            eulix-cli/internal/assets/bins/eulix_parser_macos_arm
-
-      - name: Hash parser
-        id: parser_hash
-        run: |
-          HASH=$(shasum -a 256 \
-            eulix-cli/internal/assets/bins/eulix_parser_macos_arm \
-            | awk '{print $1}')
-
+          # hash of the parser for this os+arch
+          if command -v sha256sum >/dev/null 2>&1; then
+            HASH=$(sha256sum "$BINS/${PARSER_BIN}" | awk '{print $1}')
+          else
+            HASH=$(shasum -a 256 "$BINS/${PARSER_BIN}" | awk '{print $1}')
+          fi
+          echo "Parser hash: ${HASH}"
           echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
 
-      - name: Build macOS Go binaries
+          ls -la "$BINS"
+
+      - name: Build eulix CLI
         working-directory: ./eulix-cli
         env:
-          HASH_MACOS_ARM: ${{ steps.parser_hash.outputs.hash }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          HASH: ${{ steps.stage.outputs.hash }}
+          VARIANTS: ${{ matrix.variants }}
+          EXT: ${{ matrix.ext }}
         run: |
-          for pair in "onnx-amd.txt:amd" "onnx-nvidia.txt:nvidia"; do
-            req_file="${pair%%:*}"
-            tag="${pair##*:}"
+          for pair in $VARIANTS; do
+            req="${pair%%|*}"
+            out="${pair##*|}"
 
-            echo "Building macOS ARM64 '${tag}' variant..."
+            echo "Building ${GOOS}/${GOARCH} (embed_requirements=${req}) -> ${out}${EXT}"
 
-            GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 \
             go build \
-              -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=${req_file}' -X 'eulix/internal/assets.embeddedParserHash=${HASH_MACOS_ARM}'" \
+              -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=${req}' -X 'eulix/internal/assets.embeddedParserHash=${HASH}'" \
               -trimpath \
-              -o "eulix_macos_arm_${tag}" \
+              -o "../dist/${out}${EXT}" \
               ./cmd/eulix/main.go
           done
 
-      - name: Upload macOS ARM64 artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-macos-arm64
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
           if-no-files-found: error
-          path: |
-            eulix-cli/eulix_macos_arm_amd
-            eulix-cli/eulix_macos_arm_nvidia
-            eulix-parser/target/release/eulix_parser
-
-
-  build-macos-intel:
-    name: Build macOS Intel binaries
-    runs-on: macos-13
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          rustflags: ''
-
-      - name: Build eulix-parser
-        working-directory: ./eulix-parser
-        run: |
-          cargo build --release
-
-      - name: Copy parser binary
-        run: |
-          mkdir -p eulix-cli/internal/assets/bins
-          cp eulix-parser/target/release/eulix_parser \
-            eulix-cli/internal/assets/bins/eulix_parser_macos_intel
-
-      - name: Hash parser
-        id: parser_hash
-        run: |
-          HASH=$(shasum -a 256 \
-            eulix-cli/internal/assets/bins/eulix_parser_macos_intel \
-            | awk '{print $1}')
-
-          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
-
-      - name: Build macOS Go binaries
-        working-directory: ./eulix-cli
-        env:
-          HASH_MACOS_INTEL: ${{ steps.parser_hash.outputs.hash }}
-        run: |
-          for pair in "onnx-amd.txt:amd" "onnx-nvidia.txt:nvidia"; do
-            req_file="${pair%%:*}"
-            tag="${pair##*:}"
-
-            echo "Building macOS Intel '${tag}' variant..."
-
-            GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 \
-            go build \
-              -ldflags="-s -w -X 'eulix/internal/assets.embed_requirements=${req_file}' -X 'eulix/internal/assets.embeddedParserHash=${HASH_MACOS_INTEL}'" \
-              -trimpath \
-              -o "eulix_macos_intel_${tag}" \
-              ./cmd/eulix/main.go
-          done
-
-      - name: Upload macOS Intel artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-macos-intel
-          if-no-files-found: error
-          path: |
-            eulix-cli/eulix_macos_intel_amd
-            eulix-cli/eulix_macos_intel_nvidia
-            eulix-parser/target/release/eulix_parser
-
 
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-
     needs:
-      - build-linux
-      - build-windows
-      - build-macos
-      - build-macos-intel
-
+      - package-embed
+      - build
     if: startsWith(github.ref, 'refs/tags/')
 
     permissions:
       contents: write
 
     steps:
-      - name: Download Linux artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: build-linux
-          path: artifacts/linux
+          pattern: dist-*
+          merge-multiple: true
+          path: release_assets
 
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-windows
-          path: artifacts/windows
-
-      - name: Download macOS ARM64 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-macos-arm64
-          path: artifacts/macos-arm64
-
-      - name: Download macOS Intel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: build-macos-intel
-          path: artifacts/macos-intel
-
-      - name: Organize release assets
+      - name: Generate checksums
+        working-directory: release_assets
         run: |
-          mkdir -p release_assets
-
-          # Linux
-          cp artifacts/linux/eulix-cli/eulix_linux_amd \
-            release_assets/eulix-linux-amd64-onnx-amd
-
-          cp artifacts/linux/eulix-cli/eulix_linux_nvidia \
-            release_assets/eulix-linux-amd64-onnx-nvidia
-
-          cp artifacts/linux/eulix-parser/target/release/eulix_parser \
-            release_assets/eulix-parser-linux-amd64
-
-          cp artifacts/linux/eulix-embed.zip \
-            release_assets/eulix-embed.zip
-
-          # Windows
-          cp artifacts/windows/eulix-cli/eulix_windows_amd.exe \
-            release_assets/eulix-windows-amd64-onnx-amd.exe
-
-          cp artifacts/windows/eulix-cli/eulix_windows_nvidia.exe \
-            release_assets/eulix-windows-amd64-onnx-nvidia.exe
-
-          cp artifacts/windows/eulix-parser/target/release/eulix_parser.exe \
-            release_assets/eulix-parser-windows-amd64.exe
-
-          # macOS ARM64
-          cp artifacts/macos-arm64/eulix-cli/eulix_macos_arm_amd \
-            release_assets/eulix-darwin-arm64-onnx-amd
-
-          cp artifacts/macos-arm64/eulix-cli/eulix_macos_arm_nvidia \
-            release_assets/eulix-darwin-arm64-onnx-nvidia
-
-          cp artifacts/macos-arm64/eulix-parser/target/release/eulix_parser \
-            release_assets/eulix-parser-darwin-arm64
-
-          # macOS Intel
-          cp artifacts/macos-intel/eulix-cli/eulix_macos_intel_amd \
-            release_assets/eulix-darwin-amd64-onnx-amd
-
-          cp artifacts/macos-intel/eulix-cli/eulix_macos_intel_nvidia \
-            release_assets/eulix-darwin-amd64-onnx-nvidia
-
-          cp artifacts/macos-intel/eulix-parser/target/release/eulix_parser \
-            release_assets/eulix-parser-darwin-amd64
-
-          # Checksums
-          cd release_assets
+          ls -la
           sha256sum * > checksums.txt
-          cd ..
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: |
-            release_assets/*
+          files: release_assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
